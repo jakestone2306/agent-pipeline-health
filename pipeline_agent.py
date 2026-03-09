@@ -1,6 +1,5 @@
 """
-Pipeline Health Agent - Optimized
-Batches deal analysis via a single Claude call instead of one per deal.
+Pipeline Health Agent - Sales Pipeline Only, Size-Tiered Actions
 """
 
 import os
@@ -25,13 +24,8 @@ OWNER_MAP = {
     "170827178": {"name": "Jake Stone",     "slack_id": "U08357HEYJF"},
 }
 
-PIPELINE_NAMES = {
-    "default":   "Sales Pipeline",
-    "716607755": "Growth Pipeline",
-    "718920103": "No Show Pipeline",
-    "668490044": "Enterprise Pipeline",
-    "691837998": "Partner Pipeline",
-}
+# ✅ Only the Sales Pipeline
+SALES_PIPELINE_ID = "default"
 
 STAGE_NAMES = {
     "appointmentscheduled": "Demo Scheduled",
@@ -42,17 +36,6 @@ STAGE_NAMES = {
     "1083966818": "Pending Customer Reference",
     "contractsent": "Onboarding Scheduled",
     "1009943555": "On Hold - Long Term",
-    "980617890":  "Initial Discovery",
-    "980617892":  "Initial Proposal",
-    "980617893":  "Infosec / Legal Review",
-    "980617894":  "POC",
-    "1072305424": "OB Held",
-    "1045587374": "Further OB Work Needed",
-    "1104816808": "Pilot Period",
-    "1243051168": "Expansion Opportunity",
-    "1045587373": "At Risk",
-    "1243051170": "Retention Convo",
-    "1048510752": "No Show - Post One Month",
 }
 
 EXCLUDED_STAGES = {
@@ -60,6 +43,18 @@ EXCLUDED_STAGES = {
     "1012659618", "998944549", "1104889877", "1045587377",
     "1045587376", "980617896", "1243051169",
 }
+
+def deal_size_tier(amount):
+    """Return deal size tier and guidance for Claude."""
+    amt = float(amount or 0)
+    if amt >= 50000:
+        return "ENTERPRISE", "This is an enterprise-level deal. Actions should be highly strategic: involve executives, consider custom proposals, executive sponsorship, business case development, ROI analysis, and multi-stakeholder alignment. Think long-term relationship, not just the transaction."
+    elif amt >= 19200:
+        return "STRATEGIC", "This is a strategic mid-market deal. Actions should be consultative: involve decision-makers, propose tailored solutions, address specific pain points, consider a champion-building strategy and internal alignment support."
+    elif amt >= 9600:
+        return "STANDARD", "This is a standard deal. Actions should be focused and efficient: clear next steps, timely follow-up, address objections, and move the deal forward with a defined timeline."
+    else:
+        return "TRANSACTIONAL", "This is a transactional deal. Actions should be quick and direct: short follow-up, clear value prop, low-friction path to close. Keep it simple and fast."
 
 def hs_post(path, payload):
     r = requests.post(
@@ -71,11 +66,13 @@ def hs_post(path, payload):
     return r.json()
 
 def fetch_active_deals():
+    """Fetch active deals from Sales Pipeline only."""
     deals, after = [], None
     while True:
         body = {
             "filterGroups": [{"filters": [
-                {"propertyName": "dealstage", "operator": "NOT_IN", "values": list(EXCLUDED_STAGES)}
+                {"propertyName": "pipeline", "operator": "EQ", "value": SALES_PIPELINE_ID},
+                {"propertyName": "dealstage", "operator": "NOT_IN", "values": list(EXCLUDED_STAGES)},
             ]}],
             "properties": ["dealname","dealstage","pipeline","amount","closedate",
                            "hubspot_owner_id","notes_last_updated","hs_deal_stage_probability"],
@@ -91,9 +88,9 @@ def fetch_active_deals():
     return deals
 
 def prioritize_deals(deals):
-    """Score and return top 30 most important deals to analyze."""
-    scored = []
+    """Score and return top 30 most important deals."""
     now = datetime.now(timezone.utc)
+    scored = []
     for deal in deals:
         p = deal["properties"]
         amount = float(p.get("amount") or 0)
@@ -105,30 +102,27 @@ def prioritize_deals(deals):
                 last_dt = datetime.fromisoformat(last_act.replace("Z","+00:00"))
                 days_stale = (now - last_dt).days
             except: pass
-
-        # Score: high value + high prob + stale = highest priority
         score = (amount / 1000) + (prob * 50) + (days_stale * 2)
         scored.append((score, deal))
-
     scored.sort(key=lambda x: x[0], reverse=True)
     return [d for _, d in scored[:30]]
 
 def analyze_deals_batch(deals):
-    """Analyze all deals in a single Claude call."""
+    """Analyze all deals in a single Claude call with size-tier context."""
     now = datetime.now(timezone.utc)
-
     deal_summaries = []
+
     for deal in deals:
         p = deal["properties"]
         name      = p.get("dealname") or "Unnamed"
         stage     = STAGE_NAMES.get(p.get("dealstage",""), p.get("dealstage",""))
-        pipeline  = PIPELINE_NAMES.get(p.get("pipeline",""), "Unknown")
         amount    = p.get("amount") or "0"
         closedate = p.get("closedate","")
         last_act  = p.get("notes_last_updated","")
         prob      = float(p.get("hs_deal_stage_probability") or 0)
         owner_id  = p.get("hubspot_owner_id","")
         owner     = OWNER_MAP.get(owner_id, {}).get("name","Unknown")
+        tier, tier_guidance = deal_size_tier(amount)
 
         days_stale, close_in = "?", "?"
         if last_act:
@@ -145,24 +139,27 @@ def analyze_deals_batch(deals):
             "name": name,
             "owner": owner,
             "owner_id": owner_id,
-            "pipeline": pipeline,
             "stage": stage,
             "amount": amount,
+            "tier": tier,
+            "tier_guidance": tier_guidance,
             "prob_pct": round(prob * 100),
             "days_stale": days_stale,
             "close_in_days": close_in,
         })
 
-    prompt = f"""You are an expert sales coach analyzing a B2B insurance software pipeline.
+    prompt = f"""You are an expert sales coach analyzing a B2B insurance software sales pipeline.
 
-Analyze each deal below and return a JSON array. Each element must have:
+Analyze each deal and return a JSON array. Each element must have:
 - id: the deal id (string, exactly as given)
-- risk_score: 1-10 (10=highest risk)
-- risks: array of 1-2 short risk strings
-- top_action: single most important action for the rep TODAY (specific, actionable)
-- manager_flag: null OR a specific action for the sales manager
+- risk_score: 1-10 (10 = highest risk of not closing or slowing down)
+- risks: array of 1-2 short, specific risk strings
+- top_action: the single most important action for the rep TODAY — CRITICALLY: tailor the strategic depth and approach to the deal's tier and tier_guidance. Enterprise deals need boardroom-level thinking; transactional deals need quick decisive actions.
+- manager_flag: null OR a specific action the sales manager should personally take to help this deal
 
-Deals to analyze:
+Use the tier_guidance field for each deal to calibrate your response appropriately.
+
+Deals:
 {json.dumps(deal_summaries, indent=2)}
 
 Return ONLY a valid JSON array, no markdown, no explanation."""
@@ -180,14 +177,14 @@ Return ONLY a valid JSON array, no markdown, no explanation."""
     return {str(a["id"]): a for a in json.loads(text.strip())}
 
 def generate_manager_summary(deal_data, analyses):
-    """Single Claude call for manager summary."""
     combined = []
     for d in deal_data:
         a = analyses.get(str(d["id"]), {})
+        tier, _ = deal_size_tier(d.get("amount", 0))
         combined.append({
-            "name": d["name"], "owner": d["owner"], "pipeline": d["pipeline"],
-            "stage": d["stage"], "amount": d["amount"],
-            "risk_score": a.get("risk_score", "?"),
+            "name": d["name"], "owner": d["owner"], "stage": d["stage"],
+            "amount": d["amount"], "tier": tier,
+            "risk_score": a.get("risk_score","?"),
             "top_action": a.get("top_action",""),
             "manager_flag": a.get("manager_flag"),
         })
@@ -195,19 +192,18 @@ def generate_manager_summary(deal_data, analyses):
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1500,
-        messages=[{"role": "user", "content": f"""You are a VP of Sales writing a pipeline health summary for the sales manager.
+        messages=[{"role": "user", "content": f"""You are a VP of Sales writing a pipeline health report for the sales manager.
 
-Pipeline data (top priority deals):
+Pipeline data (Sales Pipeline only, top priority deals):
 {json.dumps(combined, indent=2)}
 
 Write a concise Slack message (mrkdwn) covering:
-1. *Overall Pipeline Health* - deal count, total value at risk, avg risk score
-2. *Top 5 Priority Deals* - most urgent deals needing attention
-3. *Your Action Items as Manager* - specific things you should do today
-4. *Rep Coaching Notes* - any reps who need support or recognition
+1. *Overall Pipeline Health* - deal count, total value, avg risk score, and a one-line health assessment
+2. *Enterprise & Strategic Deals* - focus on the largest deals first, what's at risk, what needs manager attention
+3. *Your Action Items as Manager* - specific things you personally should do today to accelerate deals
+4. *Rep Coaching Notes* - any patterns you see, reps who need support or recognition
 
-Be direct and specific. Max 500 words. Use Slack mrkdwn (*bold*, bullet points).
-Do NOT use ## headers."""}]
+Be direct, specific, and commercially sharp. Max 500 words. Use Slack mrkdwn (*bold*, bullet points). No ## headers."""}]
     )
     return response.content[0].text.strip()
 
@@ -238,17 +234,16 @@ def slack_dm(user_id, message):
     return resp
 
 def run():
-    print("🔍 Fetching active deals...")
+    print("🔍 Fetching Sales Pipeline deals only...")
     all_deals = fetch_active_deals()
-    print(f"📊 Found {len(all_deals)} active deals — selecting top 30 to analyze")
+    print(f"📊 Found {len(all_deals)} active Sales Pipeline deals — selecting top 30")
 
     deals = prioritize_deals(all_deals)
 
     print(f"🤖 Analyzing {len(deals)} deals in batch...")
     analyses = analyze_deals_batch(deals)
-    print(f"✅ Analysis complete")
+    print("✅ Analysis complete")
 
-    # Build deal data list for manager summary
     deal_data = []
     owner_actions = {}
 
@@ -259,21 +254,20 @@ def run():
         owner_id = p.get("hubspot_owner_id","")
         amount   = p.get("amount") or "0"
         stage    = STAGE_NAMES.get(p.get("dealstage",""), p.get("dealstage",""))
-        pipeline = PIPELINE_NAMES.get(p.get("pipeline",""), "Unknown")
         owner    = OWNER_MAP.get(owner_id, {}).get("name","Unknown")
+        tier, _  = deal_size_tier(amount)
 
         analysis = analyses.get(str(deal_id), {})
         risk     = analysis.get("risk_score", 0)
         action   = analysis.get("top_action","")
 
         deal_data.append({"id": deal_id, "name": name, "owner": owner,
-                          "pipeline": pipeline, "stage": stage, "amount": amount})
+                          "stage": stage, "amount": amount})
 
-        # Create HubSpot note for medium/high risk or high value deals
         if (risk >= 4 or float(amount) >= 9600) and owner_id in OWNER_MAP and action:
             try:
                 create_hs_note(deal_id, owner_id, action)
-                print(f"  📋 Note created for: {name}")
+                print(f"  📋 [{tier}] Note created: {name}")
             except Exception as e:
                 print(f"  ⚠️ Note failed for {name}: {e}")
 
@@ -281,7 +275,7 @@ def run():
                 owner_actions[owner_id] = []
             owner_actions[owner_id].append({
                 "deal_name": name, "amount": amount, "stage": stage,
-                "action": action, "risks": analysis.get("risks",[]),
+                "tier": tier, "action": action, "risks": analysis.get("risks",[]),
             })
 
     # Slack reps
@@ -289,10 +283,15 @@ def run():
     for owner_id, actions in owner_actions.items():
         slack_id   = OWNER_MAP[owner_id]["slack_id"]
         owner_name = OWNER_MAP[owner_id]["name"]
+
+        # Sort by amount descending so largest deals appear first
+        actions.sort(key=lambda x: float(x['amount'] or 0), reverse=True)
+
         lines = [f"*🤖 Pipeline Action Items — {datetime.now().strftime('%B %d, %Y')}*\n"]
         for a in actions:
             amt = f"${float(a['amount']):,.0f}" if a['amount'] else "No amount"
-            lines.append(f"*{a['deal_name']}* ({amt} · {a['stage']})")
+            tier_emoji = {"ENTERPRISE": "🏢", "STRATEGIC": "⭐", "STANDARD": "📋", "TRANSACTIONAL": "⚡"}.get(a['tier'], "")
+            lines.append(f"{tier_emoji} *{a['deal_name']}* ({amt} · {a['stage']})")
             lines.append(f"  ✅ *Action:* {a['action']}")
             if a['risks']:
                 lines.append(f"  ⚠️ *Risks:* {', '.join(a['risks'][:2])}")
@@ -308,7 +307,7 @@ def run():
     # Manager summary
     print("\n📊 Generating manager summary...")
     summary = generate_manager_summary(deal_data, analyses)
-    header  = f"*🤖 Pipeline Health Report — {datetime.now().strftime('%B %d, %Y')}*\n\n"
+    header  = f"*🤖 Sales Pipeline Health Report — {datetime.now().strftime('%B %d, %Y')}*\n\n"
     try:
         slack_dm(MANAGER_SLACK_ID, header + summary)
         print("✅ Manager summary sent to Jake")
